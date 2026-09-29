@@ -35,9 +35,8 @@ electricity generated and fuel used by facility. This module will download the
 data as needed and provides functions to access different pages of the Excel
 workbook.
 
-
 Last edited:
-    2025-06-09
+    2026-02-26
 """
 EIA923_PAGES = {
     "1": "Page 1 Generation and Fuel Data",
@@ -95,8 +94,9 @@ def _clean_columns(df):
     return df
 
 
-def build_generation_data(
-        egrid_facilities_to_include=None, generation_years=None):
+def build_generation_data(egrid_facilities_to_include=None,
+                          generation_years=None,
+                          keep_all_cols=False):
     """Build a dataset of facility-level generation using EIA923.
 
     This function applies filters for positive generation, generation
@@ -115,6 +115,9 @@ def build_generation_data(
         Years of generation data to include in the output (default is None,
         which builds a list from the inventories of interest and eia_gen_year
         parameters).
+    keep_all_cols : bool, optional
+        Whether to keep all data frame columns or filter to just the three
+        listed below. Defaults to false (i.e., filter to three columns).
 
     Returns
     -------
@@ -152,12 +155,13 @@ def build_generation_data(
             if model_specs.include_only_egrid_facilities_with_positive_generation:
                 f_crit = final_gen_df["Net Generation (Megawatthours)"] >= 0
                 logging.info(
-                    "Filtering %d facilities with negative generation" % (
+                    "Filtering %d facilities without positive generation" % (
                         f_crit.sum())
                 )
                 final_gen_df = final_gen_df.loc[f_crit, :]
             if model_specs.filter_on_efficiency:
                 logging.info("Filtering facilities based on their efficiency")
+                # NOTE: in 2023 removes all OTHF plants; see #330 [260318; TWD]
                 final_gen_df = efficiency_filter(
                     final_gen_df,
                     model_specs.egrid_facility_efficiency_filters
@@ -191,9 +195,12 @@ def build_generation_data(
         }
     )
 
-    all_years_gen = all_years_gen.loc[:, ["FacilityID", "Electricity", "Year"]]
     all_years_gen.reset_index(drop=True, inplace=True)
     all_years_gen["Year"] = all_years_gen["Year"].astype("int32")
+    if not keep_all_cols:
+        all_years_gen = all_years_gen.loc[
+            :, ["FacilityID", "Electricity", "Year"]
+        ]
     return all_years_gen
 
 
@@ -238,7 +245,7 @@ def calculate_plant_efficiency(gen_fuel_data):
     # HOTFIX: The sum of string columns was to repeat them (e.g., 'ALALAL' for
     # three rows of 'AL') [240806;TWD].
     # HOTFIX: The NAICS Code filtering must be done here. [240806; TWD]
-    # See https://github.com/USEPA/ElectricityLCI/issues/232
+    # See https://github.com/NETL-RIC/ElectricityLCI/issues/232
     if model_specs.filter_non_egrid_emission_on_NAICS:
         logging.info("Filtering facilities by NAICS code")
         row_criteria = (gen_fuel_data['NAICS Code'] == '22') & (
@@ -312,6 +319,11 @@ def eia923_boiler_fuel(year):
     Data for faster reading on future runs.
 
     Referenced in ampd_plant_emissions.py.
+
+    Troubleshooting:
+
+    -   2011 boiler fuel data has a typo under heat content for fuels (i.e.,
+        April spelled Apirl).
     """
     expected_923_folder = join(paths.local_path, "f923_{}".format(year))
 
@@ -761,7 +773,43 @@ def group_fuel_categories(df):
 
 
 def load_eia923_excel(eia923_path, page="1"):
-    """Add docstring."""
+    """Read an EIA Form 923 worksheet.
+
+    Parameters
+    ----------
+    eia923_path : str
+        The file path to the EIA 923 workbook.
+    page : str
+        The page number, simplified.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A data frame with the following columns:
+
+        -   'plant_id',
+        -   'combined_heat_power_plant',
+        -   'plant_name',
+        -   'operator_name',
+        -   'operator_id',
+        -   'state',
+        -   'census_region',
+        -   'nerc_region',
+        -   'naics_code',
+        -   'eia_sector_number',
+        -   'sector_name',
+        -   'boiler_id',
+        -   'prime_mover_type',
+        -   'reported_fuel_type_code',
+        -   'physical_unit_label',
+        -   'quantity_of_fuel_consumed_january' through
+            'quantity_of_fuel_consumed_december'
+        -   'mmbtu_per_unit_january' through 'mmbtu_per_unit_december',
+        -   'sulfur_content_january' through 'sulfur_content_december',
+        -   'ash_content_january' through 'ash_content_december',
+        -   'total_fuel_consumption_quantity',
+        -   'year'
+    """
     page_to_load = EIA923_PAGES[page]
     header_row = EIA923_HEADER_ROWS[page]
     eia = pd.read_excel(

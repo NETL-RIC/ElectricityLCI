@@ -6,6 +6,7 @@
 ##############################################################################
 # REQUIRED MODULES
 ##############################################################################
+import datetime
 import io
 import json
 import logging
@@ -13,6 +14,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import re
 import sys
+import time
 import zipfile
 
 import requests
@@ -21,6 +23,10 @@ import pandas as pd
 from electricitylci.globals import paths
 from electricitylci.globals import data_dir
 from electricitylci.globals import output_dir
+from electricitylci.globals import API_SLEEP
+from electricitylci.globals import CAM_API_URL
+from electricitylci.globals import NREL_REC_URL
+from electricitylci.globals import COAL_BASIN_CODES
 
 
 ##############################################################################
@@ -29,19 +35,31 @@ from electricitylci.globals import output_dir
 __doc__ = """Small utility functions for use throughout the repository.
 
 Last updated:
-    2025-05-16
+    2026-03-26
 
 Changelog:
+    -   [26.03.26]: Fix long subfolder paths in archive background data
+    -   [26.03.17]: Update stewi inventory years
+    -   [26.02.10]: New filter out zero helper function
+    -   [26.01.28]: Allow resetting log levels
+    -   [25.12.12]: Add NREL REC data handler
+    -   [25.08.27]: Update archive EPA CAMS method
+    -   [25.08.13]: Move check API utility function here
+    -   [25.08.01]: Read line from file helper method
+    -   [25.06.11]: Create background data archive method
+    -   [25.06.11]: Hotfix facilitymatcher global paths
     -   [25.05.08]: Make EIA930 reference table an offline file
     -   [25.01.23]: Add logger utility methods
-    -   [25.01.14]: Add StEWI inventories of interest method.
-    -   [24.10.09]: Update find file in folder to not crash.
-    -   [24.08.05]: Create new BA code getter w/ FERC mapping.
+    -   [25.01.14]: Add StEWI inventories of interest method
+    -   [24.10.09]: Update find file in folder to not crash
+    -   [24.08.05]: Create new BA code getter w/ FERC mapping
     -   TODO: update create_ba_region_map to link with new BA code getter
     -   TODO: create a "wipe clean" method to remove all downloaded data
         within the electricitylci folder.
 """
 __all__ = [
+    "archive_epa_cams",
+    "check_api",
     "check_output_dir",
     "clean_data_store",
     "create_ba_region_map",
@@ -49,14 +67,22 @@ __all__ = [
     "download",
     "download_unzip",
     "fill_default_provider_uuids",
+    "filter_out_zero",
     "find_file_in_folder",
+    "find_upstream_location",
+    "find_worksheet_header_row",
+    "get_ba_map",
     "get_logger",
+    "get_nrel_rec",
     "get_stewi_invent_years",
     "join_with_underscore",
     "linear_search",
     "make_valid_version_num",
+    "map_ba_codes",
+    "next_month",
+    "read_line_from_file",
     "read_ba_codes",
-    "read_eia_api",
+    "read_from_api",
     "read_json",
     "read_log_file",
     "rollover_logger",
@@ -68,7 +94,7 @@ __all__ = [
 ##############################################################################
 # FUNCTIONS
 ##############################################################################
-def _build_data_store(data_file_types=None, skip_dirs=[]):
+def _build_data_store(data_file_types=None, skip_dirs=None):
     """Create a dictionary of files and folders for the data providers
     of ElectricityLCI, including stewi, stewicombo, facilitymatcher, and
     fedelemflowlist.
@@ -78,7 +104,7 @@ def _build_data_store(data_file_types=None, skip_dirs=[]):
     data_file_types : list, optional
         A list of data file type extensions (e.g., '.txt'), by default None
     skip_dirs : list, optional
-        A list of directory names to skip (not paths), by default []
+        A list of directory names to skip (not paths), by default None
 
     Returns
     -------
@@ -100,27 +126,13 @@ def _build_data_store(data_file_types=None, skip_dirs=[]):
 
     for cur_elem in ds.keys():
         cur_path = ds[cur_elem]['path']
-        for root, _, files in os.walk(cur_path):
-            # This is the directory being searched for files and folders.
-            r_dir = os.path.basename(root)
-
-            # Don't look in any folders that are to be skipped.
-            if r_dir in skip_dirs:
-                continue
-            else:
-                # Only add sub-folders
-                if root != cur_path:
-                    ds[cur_elem]['dirs'].append(root)
-                for f in files:
-                    f_path = os.path.join(root, f)
-                    if data_file_types is None:
-                        # Add all files
-                        ds[cur_elem]['files'].append(f_path)
-                    else:
-                        # Add only requested file types
-                        f_ext = os.path.splitext(f)[1]
-                        if f_ext in data_file_types:
-                            ds[cur_elem]['files'].append(f_path)
+        cur_files, cur_folders = _get_non_hidden(
+            cur_path, skip_dirs, data_file_types
+        )
+        for my_folder in cur_folders:
+            ds[cur_elem]['dirs'].append(my_folder)
+        for my_file in cur_files:
+            ds[cur_elem]['files'].append(my_file)
 
     return ds
 
@@ -145,6 +157,68 @@ def _find_empty_dirs(filepath):
             empty_dirs.append(root)
 
     return empty_dirs
+
+
+def _get_non_hidden(root_dir,
+                    skip_folders=None,
+                    file_exts=None,
+                    root_only=False):
+    """Walk through a directory and its subdirectories, yielding only
+    non-hidden files.
+
+    Parameters
+    ----------
+    root_dir : str
+        An existing folder path to walk through.
+    skip_folders : list, optional
+        List of folder names to skip. Defaults to none.
+    file_exts : list, optional
+        List of file extensions to include. Defaults to none.
+    root_only : bool, optional
+        Whether to stop at the root-directory level.
+        If false, will search subfolders.
+        Defaults to false.
+
+    Returns
+    -------
+    tuple
+        A tuple of length two:
+
+        - list, list of file paths
+        - list, list of subfolder paths
+    """
+    files = []
+    folders = []
+
+    if skip_folders is None:
+        skip_folders = []
+    if file_exts is None:
+        file_exts = []
+
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # Filter hidden folders and skip folders
+        dirnames[:] = [
+            d for d in dirnames if not d.startswith('.') and
+                d not in skip_folders
+        ]
+
+        for filename in filenames:
+            # Filter hidden files
+            if not filename.startswith('.'):
+                # Return only preferred file types (if requested)
+                if file_exts:
+                    if any(filename.endswith(ext) for ext in file_exts):
+                        files.append(os.path.join(dirpath, filename))
+                else:
+                    files.append(os.path.join(dirpath, filename))
+
+        if root_only:
+            break
+
+        for dirname in dirnames:
+            folders.append(os.path.join(dirpath, dirname))
+
+    return files, folders
 
 
 def _init_data_store():
@@ -219,7 +293,7 @@ def _init_data_store():
         data_store['stewicombo']['path'] = combo_path
 
     try:
-        fm_path = str(fm.globals.path.local_path)
+        fm_path = str(fm.globals.paths.local_path)
     except:
         logging.warning("Failed to find facilitymatcher data store!")
         del data_store['facilitymatcher']
@@ -285,6 +359,315 @@ def _process_files(filelist, to_filter=False, filter_txt="n/a"):
             elif not to_filter:
                 if not os.remove(f):
                     logging.info(msg)
+
+
+def archive_background_data(save_folder="background"):
+    """Create archives of eLCI data stores.
+
+    Archives are stored in the outputs directory in the subfolder provided
+    as ZIP files. Sub-folders in data stores are archived separately.
+    For example, stewi.zip contains the JSON files, while stewi.facility.zip
+    is the 'facility' sub-folder of stewi data store that stores the parquet
+    files. Extract each zip file and drag-and-drop subfolder to their
+    appropriate root folders to recreate the data stores.
+
+    Parameters
+    ----------
+    save_folder : str, optional
+        The folder name to create in the electricitylci output directory to
+        store the archives, by default "background"
+
+    Examples
+    --------
+    >>> from electricitylci.utils import archive_background_data
+    >>> archive_background()
+    """
+    ds = _init_data_store()
+    to_skip = ['archive', 'hidden', 'output']
+    output_path = os.path.join(output_dir, save_folder)
+    check_output_dir(output_path)
+
+    # For each datastore (i.e., `cur_elem`), archive files at the root level
+    # and separate archives for each subfolder.
+    for cur_elem in ds.keys():
+        cur_path = ds[cur_elem]['path']
+
+        # Archive root-directly level files into a ZIP (e.g., stewi.zip)
+        root_files, _ = _get_non_hidden(
+            root_dir=cur_path,
+            skip_folders=to_skip,
+            root_only=True
+        )
+        if root_files:
+            root_zip_name = os.path.basename(cur_path)
+            root_zip_name += ".zip"
+            root_zip_path = os.path.join(output_path, root_zip_name)
+
+            with zipfile.ZipFile(root_zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+                for filepath in root_files:
+                    # Manually add the root_dir folder to archive name;
+                    # overrides default behavior for single-file archives.
+                    arcname = os.path.join(
+                        os.path.basename(cur_path),
+                        os.path.basename(filepath)
+                    )
+                    z.write(filepath, arcname)
+
+            logging.info("Wrote archive to %s" % root_zip_path)
+
+        # Archive subfolder files into own ZIP (e.g., stewi.flowbyfacility.zip)
+        _, sub_folders = _get_non_hidden(cur_path, to_skip)
+        for sub_folder in sub_folders:
+            # This is the folder name from ds.keys().
+            sub_zip_name = os.path.basename(cur_path)
+            # This is the sub-folder node we are archiving.
+            sub_name = os.path.basename(sub_folder)
+
+            # Replace the upstream path with just the current folder
+            sub_zip_name = sub_folder.replace(cur_path, sub_zip_name)
+
+            # Replace folder sep with dot
+            sub_zip_name = sub_zip_name.replace(os.path.sep, ".")
+
+            # Name as .zip file and locate it in outputs
+            sub_zip_name += ".zip"
+            sub_zip_path = os.path.join(output_path, sub_zip_name)
+
+            # BUG: this fails to parse sub-sub and sub-sub-sub folder files;
+            # they all show up in the sub zip file. [26.03.27; TWD]
+            # Consider a loop with root=true until all files are accounted for.
+            sub_files, _ = _get_non_hidden(sub_folder, to_skip)
+            with zipfile.ZipFile(sub_zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+                for filepath in sub_files:
+                    # NOTE: does not include root-dir, so it's easy to drag
+                    # and drop into the folder to rebuild the data stores.
+                    arcname = os.path.join(
+                        sub_name,
+                        os.path.basename(filepath)
+                    )
+                    z.write(filepath, arcname)
+
+            logging.info("Wrote archive to %s" % sub_zip_path)
+
+
+def archive_epa_cams(year, api_key="", period="daily", time_out=60):
+    """Helper function to archive EPA's annual, daily and hourly CEMS data.
+
+    Parameters
+    ----------
+    year : int
+        The year to process (e.g., 2022). It does one year at a time.
+    api_key : str, optional
+        Your personal EPA CAMPD API key (prompt for input if not provided), by default ""
+    period : str, optional
+        One of three time periods to archive (options include: 'annual', 'daily' and 'hourly'), by default "daily"
+    time_out : int, optional
+        The timeout (in seconds) to wait for an API response.
+        API may take longer to respond for 'hourly' than for 'annual' requests.
+
+    Raises
+    ------
+    ValueError
+        If the time period provided is not one of the valid options
+
+    Notes
+    -----
+    Test the API out `here <https://campd.epa.gov/data/custom-data-download>`_
+
+    Examples
+    --------
+    >>> from electricitylci.utils import *
+    >>> log = get_logger(True, False)
+    >>> api_file = "C:\\path\\to\\epa\\api.txt"
+    >>> api_key = read_line_from_file(api_file)
+    >>> archive_epa_cams(2022, api_key, 'daily', 60)
+    """
+    # Import here to avoid circular referencing
+    from electricitylci.cems_data import CEMS_STATES
+
+    # Check that the user provided a valid API
+    cam_api = "https://www.epa.gov/power-sector/cam-api-portal#/api-key-signup"
+    api_key = check_api(api_key, "EPA", cam_api)
+
+    # Check that the user selects a valid period
+    valid_cams_periods = ['hourly', 'daily', 'annual']
+    if period not in valid_cams_periods:
+        warn_msg = (
+            "Expected, '%s', received '%s'" % (
+                ", ".join(valid_cams_periods), period
+            )
+        )
+        raise ValueError(warn_msg)
+
+    # Column naming scheme to be consistent across datasets.
+    c_map = {
+        'stateCode': 'state',
+        'facilityName': 'facility_name',
+        'facilityId': 'plant_id_eia',
+        'year': 'year',
+        'grossLoad': 'gross_load_mwh',
+        'steamLoad': 'steam_load_1000_lbs',
+        'so2Mass': 'so2_mass_tons',
+        'co2Mass': 'co2_mass_tons',
+        'noxMass': 'nox_mass_tons',
+        'heatInput': 'heat_content_mmbtu'
+    }
+    # Columns to check for data (row dropped if all entries are NaN)
+    data_cols = [
+        'gross_load_mwh',
+        'steam_load_1000_lbs',
+        'so2_mass_tons',
+        'co2_mass_tons',
+        'nox_mass_tons',
+        'heat_content_mmbtu',
+    ]
+
+    # Create the new API URL
+    cam_url = CAM_API_URL.replace("/annual/", f"/{period}/")
+
+    start_date = datetime.date(year, 1, 1)
+    end_date = datetime.date(year, 12, 31)
+
+    for state in CEMS_STATES:
+        # Define the state-level daily CEMS data file
+        archive_file = "epacems_%s_%d%s.csv" % (period, year, state.lower())
+
+        # Add a check to avoid re-running the API for files already archived
+        _found = find_file_in_folder(output_dir, [archive_file,], False)
+        if _found is not None:
+            logging.info("Found archive, '%s'" % archive_file)
+            continue
+
+        # Prepare the empty data frame
+        df = pd.DataFrame(columns=list(c_map.values()))
+
+        _success = True
+        cur_date = start_date
+        while cur_date < end_date and _success:
+            # HOTFIX: use monthly periods for hourly and daily queries
+            nxt_date = next_month(cur_date) - datetime.timedelta(days=1)
+            if period == 'annual':
+                # For annual query, set to end date
+                nxt_date = end_date
+
+            # Courtesy update to user; these API calls can take hours to run
+            logging.info("Querying %s data for %s (%s to %s)" % (
+                period, state, cur_date.isoformat(), nxt_date.isoformat()
+            ))
+
+            # Initialize variables to start the API query for all records.
+            recs_received = 0
+            recs_total = 2 # needs to >1 to initiate the loop
+            page_no = 1
+            while recs_received < (recs_total - 1):
+                # Build the params; the page number will increment
+                params = {
+                    'api_key': api_key,
+                    'beginDate': cur_date.isoformat(),
+                    'endDate': nxt_date.isoformat(),
+                    'stateCode': state,
+                    'page': page_no,
+                    'perPage': 500,  # max allowable by API is 500
+                }
+                # Query the API; url_tries will max with no data upon failing
+                # HOTFIX: incorporate time out parameter [250825; TWD]
+                max_tries = 4
+
+                try:
+                    js_list, url_tries, h_dict = read_from_api(
+                        cam_url,
+                        params=params,
+                        max_tries=max_tries,
+                        time_out=time_out
+                    )
+                except Exception as e:
+                    # Hitting urllib3 and requests errors; just kill this state
+                    logging.warning("API failed with error, '%s'" % str(e))
+                    js_list = []  # add zero to recs received
+                    h_dict = {}   # set total recs to zero
+                    url_tries = max_tries # set success to false
+
+                # EPA's rate limit is 1000 requests per hour.
+                # This limits you to 3.6 seconds per request to avoid exceeding.
+                # The API may recommend a different wait time.
+                # Daily data has roughly 12k records per state; with 49 states,
+                # that's ~600k records; that's 1200 requests, which is more than
+                # the 1000 per hour rate limit, so let's impose the 3.6s wait
+                sleep_time = h_dict.get("Retry-After", 3.6)
+                sleep_time = float(sleep_time)
+                time.sleep(sleep_time)
+
+                # update the total records and received records
+                recs_total = h_dict.get('X-Total-Count', 0)
+                recs_total = int(recs_total)
+                recs_received += len(js_list)
+
+                tmp_df = pd.DataFrame.from_dict(js_list).rename(columns=c_map)
+
+                # HOTFIX: it may be valid for a month to have no data.
+                # only skip if API fails
+                # If no data or API failed, stop the query (incomplete data)
+                if len(tmp_df) == 0 and url_tries < max_tries:
+                    logging.warning("No data for this query!")
+                elif len(tmp_df) == 0 and url_tries >= max_tries:
+                    _success = False
+                    logging.warning(
+                        "Failed to retrieve data for %s %s!" % (state, year)
+                    )
+                elif len(df) == 0 and len(tmp_df) > 0:
+                    # First time, set df
+                    df = tmp_df.copy()
+                else:
+                    # We've been here before. We're going in circles, Sam!
+                    # NOTE: columns with all NaNs will raise a FutureWarning
+                    df = pd.concat([df, tmp_df], ignore_index=True)
+
+                # Increment page to continue
+                page_no += 1
+
+            # Increment the current day by one month
+            cur_date = next_month(cur_date)
+
+        # NOTE: decision here is to save only the rows that have data.
+        # Rows with NaN values in all data columns are dropped.
+        # If you favor a more complete time series (with data gaps), then
+        # comment this line out.
+        df = df.dropna(subset=data_cols, how='all')
+
+        # Only save state's data if successful
+        if len(df) > 0 and _success:
+            # Writes to electricitylci's output folder.
+            write_csv_to_output(archive_file, df)
+        else:
+            logging.warning("Failed to write, %s" % archive_file)
+
+
+def check_api(key, owner, r_txt):
+    """Helper function to check and request for API key.
+
+    Parameters
+    ----------
+    key : str, Nonetype
+        The key to be checked.
+    owner : str
+        The API owner (e.g., 'EDX', 'EIA', or 'EPA').
+    r_txt : str
+        Helper text for acquiring an API key (e.g., registration URL).
+
+    Returns
+    -------
+    str
+        API key as provided by the user.
+    """
+    if key is None or key == "":
+        key = input("Enter %s API key: " % owner)
+        key = key.strip()
+        if key == "":
+            logging.warning(
+                "No API key given!"
+                f"Sign up here: {r_txt}"
+            )
+    return key
 
 
 def check_output_dir(out_dir):
@@ -573,7 +956,7 @@ def download_edx(resource_id, api_key, output_dir):
     content_length = response_head.headers.get('Content-Length')
     resource_size = int(content_length) if content_length is not None else None
 
-    logging.debug("Resource Name:", filename)
+    logging.debug("Resource Name: %s" % filename)
     logging.debug(f"Resource Size: {resource_size} bytes")
 
     # HOTFIX: assign the output directory
@@ -729,6 +1112,44 @@ def fill_default_provider_uuids(dict_to_fill, *args):
     return dict_to_fill
 
 
+def filter_out_zero(df, col_name):
+    """Filter all rows with zero value in a given column from a pandas data
+    frame.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        A data frame that must have a column, ``col_name`` that is numeric.
+    col_name : str
+        A column name in ``df`` that may have zero values that correspond to
+        rows that are unwanted.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The same data frame that is sent where rows with a zero value in
+        ``col_name`` are dropped.
+
+    Raises
+    ------
+    IndexError
+        If the column name does not exist in the data frame.
+    TypeError
+        If the column's data type is not numeric (must be able to have a zero
+        value).
+    """
+    if col_name not in df.columns:
+        raise IndexError("Column, '%s', not in data frame!" % col_name)
+    if not pd.api.types.is_numeric_dtype(df[col_name]):
+        raise TypeError("Column, '%s', is not numeric!" % col_name)
+
+    zero_filter = df[col_name] != 0
+    logging.debug(
+        "Dropping %d rows from column, '%s'" % (zero_filter.sum(), col_name)
+    )
+    return df.loc[zero_filter, :]
+
+
 def find_file_in_folder(folder_path, file_pattern_match, return_name=True):
     """Search a folder for files matching a pattern.
 
@@ -781,6 +1202,163 @@ def find_file_in_folder(folder_path, file_pattern_match, return_name=True):
         return (file_path, file_name)
 
 
+def find_upstream_location(process_name, fuel_type):
+    """Helper function to extract regional names from upstream processes
+    including coal, oil, gas, nuclear, and construction.
+
+    Parameters
+    ----------
+    process_name : str
+        A process name (e.g., 'natural gas extraction, processing, and transport - Northeast')
+    fuel_type : str
+        A fuel type (e.g., 'GAS')
+
+    Returns
+    -------
+    str
+        Location string (e.g., 'US', 'Northeast', or 'RFO PADD 5').
+
+    Notes
+    -----
+    This method is specifically designed to work with eLCI process names,
+    not ILCD process names. At time of writing, ILCD naming is assumed to
+    a post-processing step (configurable in the model specs YAML) that
+    changes process names without changing UUIDs that are built on the
+    original eLCI process names.
+
+    See reference to method in ``_process_table_creation_gen`` in
+    upstream_dict.py.
+
+    Examples
+    --------
+    >>> find_upstream_location(
+    ...     'power plant construction - solar_thermal_const - US Average',
+    ...     'SOLARTHERM_CONSTRUCTION')
+    'US'
+    >>> find_upstream_location(
+    ...     'natural gas extraction, processing, and transport - Northeast',
+    ...     'GAS')
+    'Northeast'
+    """
+    match fuel_type:
+        case 'coal_transport' | 'NUCLEAR' | 'OIL':
+            return 'US'
+        case 'COAL':
+            # Search across basin names
+            for basin_name in COAL_BASIN_CODES:
+                if basin_name in process_name:
+                    return basin_name
+        case 'GAS':
+            # Take the words after the last hyphen.
+            return process_name.rpartition('-')[-1].strip()
+        case name if name.endswith('CONSTRUCTION'):
+            # Note that some BA names have hyphens, so stop at the first two.
+            loc_parts = process_name.split("-", 2)
+            # Clean up the location name
+            loc_name = loc_parts[2].strip() if len(loc_parts) > 2 else ""
+            # Correct for national average construction
+            if loc_name == 'US Average':
+                loc_name = 'US'
+            return loc_name
+        case _:
+            # All others will be treated thusly.
+            return ""
+
+
+def find_worksheet_header_row(workbook, worksheet, keywords, num_rows_to_scan):
+    """Dynamically scans the top rows of an Excel worksheet to find the
+    header row based on a list of identifying keywords.
+
+    This function reads a limited number of rows (num_rows_to_scan) without a
+    header, iterates through them, and checks if all provided keywords are
+    present in any single row's content. It is designed to handle Excel files
+    where the header row position changes across different vintages.
+
+    Parameters
+    ----------
+    workbook : str
+        The file path to the Excel workbook (.xlsx, .xls, etc.).
+    worksheet : str, int
+        The name (str) or index (int) of the worksheet to scan.
+    keywords : list
+        A list of required column names (or parts of names) that uniquely
+        identify the correct header row. Matching is case-insensitive.
+    num_rows_to_scan : int
+        The maximum number of initial rows to read from the worksheet to
+        search for the header.
+
+    Returns
+    -------
+    int
+        The 0-based row index of the detected header, or -1 if the header
+        was not found within the scanned range or if an error occurred.
+
+    Examples
+    --------
+    >>> wb = 'data.xlsx'
+    >>> ws = 'Sheet1'
+    >>> required_cols = ['Year', 'Emissions', 'Region']
+    >>> idx = find_worksheet_header_row(wb, ws, required_cols, 20)
+
+    Notes
+    -----
+    This method was built using Gemini AI.
+    """
+    header_row_index = -1
+
+    try:
+        # A temporary slice of the worksheet.
+        df_temp = pd.read_excel(
+            workbook,
+            header=None,
+            sheet_name=worksheet,
+            nrows=num_rows_to_scan
+        )
+        for idx, row in df_temp.iterrows():
+            # Convert to single, lowercase string for keyword checking
+            row_content = ' '.join(
+                row.dropna().astype(str).str.lower().tolist()
+            )
+            if all(keyword.lower() in row_content for keyword in keywords):
+                header_row_index = idx
+                break
+
+        if header_row_index == -1:
+            logging.error(
+                "Header row not found in the first %d rows!" % (
+                    num_rows_to_scan
+                )
+            )
+    except FileNotFoundError:
+        logging.error("Failed to find Excel workbook!")
+    except Exception as e:
+        logging.error("Unexpected error, %s" % str(e))
+
+    return  header_row_index
+
+
+def get_ba_map():
+    """Return a dictionary of balancing authority names and their abbreviations.
+
+    Parameters
+    ----------
+    year : int
+        The year for eLCI generation data.
+
+    Returns
+    -------
+    dict
+        A dictionary with keys of balancing authority names (as per EIA 923)
+        and values of abbreviations.
+    """
+    ba_codes = read_ba_codes()
+    ba_map = {}
+    for idx, row in ba_codes.iterrows():
+        ba_map[row['BA_Name']] = idx
+
+    return ba_map
+
+
 def get_logger(stream=True, rfh=True, str_lv='INFO', rfh_lv='DEBUG'):
     """A helper function for creating or retrieving a root logger with
     only one instance of stream and/or rotating file handler.
@@ -822,8 +1400,10 @@ def get_logger(stream=True, rfh=True, str_lv='INFO', rfh_lv='DEBUG'):
     for h in log.handlers:
         if h.name == 'elci_stream':
             has_stream = True
+            h.setLevel(str_lv)      # handle level change requests
         elif h.name == 'elci_rfh':
             has_rfh = True
+            h.setLevel(rfh_lv)
 
     # Create stream handler for info messages
     if stream and not has_stream:
@@ -854,6 +1434,98 @@ def get_logger(stream=True, rfh=True, str_lv='INFO', rfh_lv='DEBUG'):
             log.handlers[i].setLevel("CRITICAL")
 
     return log
+
+
+def get_nrel_rec(year):
+    """Create state-level voluntary green power generation (MWh) data frame.
+
+    Notes
+    -----
+    Data are based on the NLR Green Power Data by State (2013-2023)[1]_.
+    Estimates are based on green power generated in each state, regardless of
+    where the renewable energy certificate (REC) is retired.
+    Some state-level totals do not add up to market-wide totals because some
+    green power is purchased from Canada.
+
+    There is an estimated 192.1 million MWh sold in 2020.
+
+    [1] E. O'Shaughnessy, S. Jena, and D. Salyer. 2024. Status and Trends in
+    the Voluntary Market (2023 Data). Golden, CO: NLR.
+
+    See also
+    --------
+    1.  https://www.nlr.gov/analysis/renewable-power
+    2.  https://data.nlr.gov/submissions/174
+
+    Parameters
+    ----------
+    year : int
+        The year for REC sales data.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A data frame with state-based green electricity generated (MWh).
+        The "State" column provides the two-letter U.S. state name
+        abbreviations and the "Total" column provides the total green
+        electricity generated and sold as a REC in MWh.
+
+        Other columns include:
+        - "Year" (matches the year provided)
+        - "Utility Green Pricing"
+        - "Utility Renewable Contracts"
+        - "Competitive Suppliers"
+        - "Unbundled RECs"
+        - "CCAs" (community choice aggregations)
+        - "PPAs" (power purchase agreements)
+
+    Examples
+    --------
+    >>> my_df = get_rec(2023)
+    """
+    # Make sure year is an integer and in the valid range
+    if not isinstance(year, int):
+        raise TypeError("Year should be an integer not, %s" % type(year))
+    if year not in range(2016, 2025, 1):
+        raise ValueError("Year should be between 2016-2024, not %d" % year)
+
+    # Define the NLR data store
+    nrel_dir = os.path.join(paths.local_path, "nlr")
+    if check_output_dir(nrel_dir):
+        logging.debug("NLR data store exists")
+
+    # Define the NLR REC Excel workbook file path
+    rec_name = os.path.basename(NREL_REC_URL)
+    rec_path = os.path.join(nrel_dir, rec_name)
+
+    # If file does not exist, download Excel workbook
+    if not os.path.exists(rec_path):
+        download(NREL_REC_URL, rec_path)
+
+    if not os.path.exists(rec_path):
+        raise OSError(
+            "Failed to download NLR Voluntary Renewable Procurement workbook!"
+        )
+
+    # Dynamically find header row (it may change depending on the workbook year)
+    header_row = find_worksheet_header_row(
+        rec_path,
+        "State-Level Generation",
+        ["state", "year", "PPAs", "total"],
+        20
+    )
+
+    # Sheet name, header, and index are based on examining the file.
+    df = pd.read_excel(
+        rec_path,
+        sheet_name="State-Level Generation",
+        header=header_row,
+        index_col=None
+    )
+    # Ensure year is integer for comparison purposes
+    df["Year"] = df["Year"].astype(int)
+    df = df.loc[df["Year"]==year]
+    return df
 
 
 def get_stewi_invent_years(year):
@@ -897,10 +1569,10 @@ def get_stewi_invent_years(year):
     STEWI_DATA_VINTAGES = {
         # 'DMR': [x for x in range(2011, 2023, 1)],
         # 'GHGRP': [x for x in range(2011, 2023, 1)],
-        'eGRID': [2014, 2016, 2018, 2019, 2020, 2021],
+        'eGRID': [2014, 2016, 2018, 2019, 2020, 2021, 2022, 2023],
         'NEI': [2011, 2014, 2017, 2020],
-        'RCRAInfo': [x for x in range(2011, 2023, 2)],
-        'TRI': [x for x in range(2011, 2023, 1)],
+        'RCRAInfo': [x for x in range(2011, 2024, 2)],
+        'TRI': [x for x in range(2011, 2024, 1)],
     }
 
     r_dict = {}
@@ -1003,6 +1675,85 @@ def make_valid_version_num(foo):
     return result
 
 
+def map_ba_codes(df):
+    """Map balancing authority abbreviation codes based on EIA Form 930 naming.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        A data frame with column, 'Subregion' or 'BA_NAME' used to match
+        against balancing authority abbreviation map.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The same as the sent data frame with a new column, "BA_CODE".
+    """
+    m_col = 'Subregion'
+    if 'Subregion' not in df.columns and 'BA_NAME' in df.columns:
+        m_col = 'BA_NAME'
+    elif 'Subregion' not in df.columns and 'BA_NAME' not in df.columns:
+        logging.warning("No matching column for BA codes!")
+
+    ba_map = get_ba_map()
+    df['BA_CODE'] = df[m_col].map(ba_map)
+    logging.info("%d mis-matched BA codes" % df['BA_CODE'].isna().sum())
+    return df
+
+
+def next_month(dt0):
+    """Move a datetime object to the first day of the next month.
+
+    Parameters
+    ----------
+    dt0 : datetime.date
+
+    Returns
+    -------
+    datetime.date
+
+    Notes
+    -----
+    A. Balogh (2010), ActiveState Code
+    http://code.activestate.com/recipes/577274-subtract-or-add-a-month-to-a-datetimedate-or-datet/
+    """
+    dt1 = dt0.replace(day=1)
+    dt2 = dt1 + datetime.timedelta(days=32)
+    dt3 = dt2.replace(day=1)
+    return dt3
+
+
+def read_line_from_file(filename):
+    """Helper function to read a single-line from a text file.
+
+    Parameters
+    ----------
+    filename : str
+        A text file storing a single line of text (i.e., API key).
+
+    Returns
+    -------
+    str
+        The string read from a text file.
+
+    Examples
+    --------
+    >>> my_file = "eia_api.txt"
+    >>> my_api_key = read_line_from_file(my_file)
+    """
+    try:
+        with open(filename, 'r') as f:
+            my_line = f.readline().strip()
+            return my_line
+    except FileNotFoundError:
+        logging.error("Failed to file file, '%s'!" % filename)
+        return None
+    except Exception as e:
+        logging.error("Unexpected error when reading file, '%s'!" % filename)
+        logging.error(f"{e}")
+        return None
+
+
 def read_ba_codes_old():
     """Create a data frame of balancing authority names and codes.
 
@@ -1057,7 +1808,7 @@ def read_ba_codes():
     table, which includes a comprehensive list of balancing authorities, see
     https://www.eia.gov/electricity/930-content/EIA930_Reference_Tables.xlsx
 
-    Referenced in combinatory.py, eia_io_trading.py, and import_impacts.py
+    Referenced in combinator.py, eia_io_trading.py, and import_impacts.py
     and is utilized elsewhere (e.g., via importing `BA_CODES` from combinator).
 
     Returns
@@ -1132,7 +1883,7 @@ def read_ba_codes():
         "Alaska": "AK",
         "Hawaii": "HI",
     }
-    logging.info("Reading EIA930 reference table")
+    logging.debug("Reading EIA930 reference table")
     df = pd.read_excel(data_path_local)
     df = df.rename(columns={
         'BA Code': 'BA_Acronym',
@@ -1189,7 +1940,7 @@ def read_ba_codes():
     return df
 
 
-def read_eia_api(url, url_try=0, max_tries=5):
+def read_from_api(url, params=None, url_try=0, max_tries=5, time_out=20):
     """Return a JSON data response from EIA's API.
 
     Parameters
@@ -1200,56 +1951,61 @@ def read_eia_api(url, url_try=0, max_tries=5):
         Internal counter for URL retries; default is 0
     max_tries : int
         When to stop retrying; default is 5
+    time_out : int
+        The timeout (in seconds) to wait for an API request return
 
-    Returns:
-    (dict, int)
-        The JSON response and URL try count.
-        The JSON dictionary includes keys:
+    Returns
+    -------
+    tuple
+        A tuple of length two.
 
-        -   'response' (dict): with keys:
+        - a dict of the JSON response (EIA) or a list of JSON data (EPA)
+        - int, the URL try count
+        - dict, the response headers (includes the X-total-count for EPA)
 
-            -   'total' (int): count of records in 'data'
-            -   'dateFormat' (str): For example, 'YYYY-MM-DD"T"HH24'
-            -   'frequency' (str): For example, 'hourly'
-            -   'description' (str): Data description
-            -   'data' (list): Dictionaries with keys:
+    Notes
+    ----
+    The EPA CAMPD API has a rate limit of 1000 requests per hour:
+    https://www.epa.gov/power-sector/cam-api-portal#/frequent-questions.
+    (3.6 s per request)
 
-                -   'period'
-                -   'fromba': for ID only
-                -   'fromba-name': for ID only
-                -   'toba': for ID only
-                -   'toba-name': for ID only
-                -   'respondent': for D and NG only
-                -   'respondent-name': for D and NG only
-                -   'type': for D and NG only
-                -   'type-name': for D and NG only
-                -   'value'
-                -   'value-units'
+    EIA does not impose throttling, but recommend that you stay under
+    9000 requests per hour with no more than 5 requests per second (see FAQ):
+    https://www.eia.gov/opendata/documentation.php.
+    (0.4 s per request)
 
-        -   'request' (dict): Parameters sent to the API
-        -   'apiVersion' (str): API version string (e.g., '2.1.7')
-        -   'ExcelAddInVersion' (str): AddIn version string (e.g., '2.1.0')
     """
     r_dict = {}
+    h_dict = {}
     url_try += 1
-    #adding 20s timeout to avoid long delays due to server issues.
-    r = requests.get(url, timeout=20)
+    # Add 20s timeout to avoid long delays due to server issues.
+    if params is not None:
+        r = requests.get(url, params=params, timeout=time_out)
+    else:
+        r = requests.get(url, timeout=time_out)
+
     r_status = r.status_code
+    h_dict = dict(r.headers)
     if r_status == 200:
-        r_content = r.content
+        # Cast the case-insensitive dictionary to regular Python dict
         try:
             r_dict = r.json()
         except:
-            # If at first you, fail...
-            r_content = decode_str(r_content)
+            # If at first you fail, try again!
+            r_content = decode_str(r.content)
             r_dict = json.loads(r_content)
     else:
         if url_try < max_tries:
-            r_dict, url_try = read_eia_api(url, url_try, max_tries)
+            time.sleep(API_SLEEP)
+            r_dict, url_try, h_dict = read_from_api(
+                url, params, url_try, max_tries, time_out
+            )
         else:
-            logging.error("Requests failed!")
+            logging.error(
+                "Requests failed! Status code '%s'." % r_status
+            )
 
-    return (r_dict, url_try)
+    return (r_dict, url_try, h_dict)
 
 
 def read_json(json_path):
@@ -1401,7 +2157,7 @@ def set_dir(directory):
     return directory
 
 
-def write_csv_to_output(f_name, data):
+def write_csv_to_output(f_name, data, to_zip=False, add_index=False):
     """Write data to CSV file in the outputs directory.
 
     Parameters
@@ -1412,29 +2168,62 @@ def write_csv_to_output(f_name, data):
         A data object to be written to file.
         A data frame is written using `to_csv` without index.
         A string is written to a plain text file.
+    to_zip : bool, optional
+        Whether to compress the output data using ZIP format.
+        Defaults to false.
+    add_index : bool, optional
+        Whether to include a data frame's index in the output CSV.
+        Defaults to false.
 
     Raises
     ------
     TypeError : If the data type is not recognized.
     """
-    f_path = os.path.join(output_dir, f_name)
-    if os.path.isfile(f_path):
-        logging.warn("File exists! Overwriting %s" % f_path)
+    fpath = os.path.join(output_dir, f_name)
+
+    if os.path.isfile(fpath):
+        logging.warning("File exists! Overwriting %s" % fpath)
+
     if isinstance(data, pd.DataFrame):
-        try:
-            data.to_csv(f_path, index=False)
-        except:
-            logging.error("Failed to write '%s' to file" % f_path)
+        if to_zip:
+            if not fpath.endswith('.zip'):
+                fpath += ".zip"
+            try:
+                data.to_csv(
+                    fpath, encoding="utf-8", compression="zip", index=add_index)
+            except:
+                raise
+            else:
+                logging.debug("Saved dataframe to zip.")
         else:
-            logging.info("Wrote data to file, %s" % f_path)
+            try:
+                data.to_csv(fpath, index=add_index, encoding="utf-8")
+            except:
+                raise
+            else:
+                logging.debug("Saved dataframe to CSV.")
     elif isinstance(data, str):
-        try:
-            with open(f_path, 'w') as f:
-                f.write(data)
-        except:
-            logging.error("Failed to write '%s' to file" % f_path)
+        if to_zip:
+            if not fpath.endswith(".zip"):
+                fpath += ".zip"
+            try:
+                with zipfile.ZipFile(fpath,
+                             'w',
+                             compression=zipfile.ZIP_DEFLATED,
+                             compresslevel=3) as z:
+                    z.write(data, arcname=os.path.basename(fpath))
+            except:
+                raise
+            else:
+                logging.debug("Saved data to zip.")
         else:
-            logging.info("Wrote data to file, %s" % f_path)
+            try:
+                with open(fpath, 'w') as f:
+                    f.write(data)
+            except:
+                raise
+            else:
+                logging.debug("Saved data to CSV.")
     else:
         logging.error("Data type, %s, not recognized!" % type(data))
         raise TypeError("Data type, %s, not recognized!" % type(data))

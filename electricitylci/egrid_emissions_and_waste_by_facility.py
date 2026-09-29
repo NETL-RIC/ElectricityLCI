@@ -79,7 +79,7 @@ def get_combined_stewicombo_file(model_specs):
         # relies on stewicombo, then delete the stewi and stewicombo data store
         # folders on your computer (see globals.get_datastore_dir), then run
         # try again. This will pull StEWI's pre-processed data. See GitHub
-        # issue: https://github.com/USEPA/standardizedinventories/issues/151
+        # issue: https://github.com/NETL-RIC/standardizedinventories/issues/151
         df = cbi(
             base_inventory = base_inventory,
             inventory_dict = model_specs.inventories_of_interest,
@@ -112,6 +112,7 @@ if __name__ == "__main__":
     emissions_and_wastes_by_facility = get_combined_stewicombo_file(
         model_config)
     len(emissions_and_wastes_by_facility)
+    # for 'ELCI_2023': 90238 [251125; TWD]
     # for 'ELCI_2020': 88005 [250416; TWD]
     # for 'ELCI_1': 106284 (recorded as 88310 [250416;TWD])
 
