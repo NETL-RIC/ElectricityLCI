@@ -408,14 +408,19 @@ def eia_7a_download(year, save_path):
             'coalpublic{}.xlsx'.format(year))
     url = eia7a_base_url + name
     try:
-        os.makedirs(save_path)
         logging.info('Downloading EIA 7-A data...')
         eia_7a_file = requests.get(url)
+        # Without this, an error page from EIA is saved as the workbook and the
+        # failure only shows up later as an unreadable Excel file.
+        eia_7a_file.raise_for_status()
+        os.makedirs(save_path, exist_ok=True)
         file_path = os.path.join(save_path, name)
-        open(file_path, 'wb').write(eia_7a_file.content)
-    except:
-        logging.info(
-            'Error downloading eia-7a: try manually downloading from %s' % url)
+        with open(file_path, 'wb') as f:
+            f.write(eia_7a_file.content)
+    except Exception as e:
+        logging.warning(
+            'Error downloading eia-7a (%s): try manually downloading from %s'
+            % (e, url))
 
 
 def fix_coal_mining_lci(df):
